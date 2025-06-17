@@ -1,0 +1,127 @@
+TASK check_and_update_campaign_statuses():
+    // Runs every 5 minutes
+    campaigns = GET_ALL_CAMPAIGNS_WITH_BRAND()
+    status_changes = {
+        activated: 0,
+        budget_paused: 0,
+        dayparting_paused: 0,
+        deactivated: 0
+    }
+    
+    FOR EACH campaign IN campaigns:
+        old_status = campaign.status
+        campaign.update_status()
+        
+        // Track changes for monitoring
+        IF old_status != campaign.status:
+            INCREMENT status_changes[GET_CHANGE_TYPE(campaign.status)]
+    
+    LOG("Campaign status update completed", status_changes)
+    RETURN status_changes
+
+
+TASK recalculate_spend_totals():
+    // Runs every 10 minutes to ensure data consistency
+    today = GET_CURRENT_DATE()
+    current_month_start = GET_FIRST_DAY_OF_CURRENT_MONTH()
+    
+    // Recalculate campaign totals
+    campaigns = GET_ALL_CAMPAIGNS()
+    FOR EACH campaign IN campaigns:
+        daily_total = SUM(AdSpend.amount WHERE campaign=campaign AND date=today)
+        monthly_total = SUM(AdSpend.amount WHERE campaign=campaign AND date>=current_month_start)
+        
+        campaign.daily_spend = daily_total OR 0
+        campaign.monthly_spend = monthly_total OR 0
+        SAVE(campaign)
+    
+    // Recalculate brand totals
+    brands = GET_ALL_BRANDS()
+    FOR EACH brand IN brands:
+        daily_total = SUM(AdSpend.amount WHERE campaign.brand=brand AND date=today)
+        monthly_total = SUM(AdSpend.amount WHERE campaign.brand=brand AND date>=current_month_start)
+        
+        brand.daily_spend = daily_total OR 0
+        brand.monthly_spend = monthly_total OR 0
+        SAVE(brand)
+    
+    LOG("Spend totals recalculation completed")
+
+
+TASK reset_daily_budgets():
+    // Runs daily at midnight (00:00 UTC)
+    LOG("Starting daily budget reset")
+    
+    // Reset all daily spend counters
+    UPDATE Brand SET daily_spend = 0
+    UPDATE Campaign SET daily_spend = 0
+    
+    // Update campaign statuses (may reactivate paused campaigns)
+    campaigns = GET_ALL_CAMPAIGNS()
+    reactivated_count = 0
+    
+    FOR EACH campaign IN campaigns:
+        old_status = campaign.status
+        campaign.update_status()
+        
+        IF old_status == 'budget_exceeded' AND campaign.status == 'active':
+            INCREMENT reactivated_count
+    
+    LOG("Daily budget reset completed", reactivated_count, "campaigns reactivated")
+
+
+TASK reset_monthly_budgets():
+    // Runs on 1st day of month at midnight (00:00 UTC)
+    LOG("Starting monthly budget reset")
+    
+    // Reset all monthly spend counters
+    UPDATE Brand SET monthly_spend = 0
+    UPDATE Campaign SET monthly_spend = 0
+    
+    // Update campaign statuses
+    campaigns = GET_ALL_CAMPAIGNS()
+    reactivated_count = 0
+    
+    FOR EACH campaign IN campaigns:
+        old_status = campaign.status
+        campaign.update_status()
+        
+        IF old_status == 'budget_exceeded' AND campaign.status == 'active':
+            INCREMENT reactivated_count
+    
+    LOG("Monthly budget reset completed", reactivated_count, "campaigns reactivated")
+
+
+TASK monitor_budget_limits():
+    // Runs every 15 minutes
+    alerts = []
+    brands = GET_ACTIVE_BRANDS()
+    
+    FOR EACH brand IN brands:
+        // Check daily budget alerts (90% threshold)
+        IF brand.daily_spend >= (brand.daily_budget * 0.9):
+            percent_used = (brand.daily_spend / brand.daily_budget) * 100
+            alerts.APPEND({
+                type: 'daily_budget_warning',
+                brand: brand.name,
+                percent_used: percent_used,
+                spend: brand.daily_spend,
+                budget: brand.daily_budget
+            })
+        
+        // Check monthly budget alerts (90% threshold)
+        IF brand.monthly_spend >= (brand.monthly_budget * 0.9):
+            percent_used = (brand.monthly_spend / brand.monthly_budget) * 100
+            alerts.APPEND({
+                type: 'monthly_budget_warning',
+                brand: brand.name,
+                percent_used: percent_used,
+                spend: brand.monthly_spend,
+                budget: brand.monthly_budget
+            })
+    
+    IF alerts.LENGTH > 0:
+        LOG("Budget alerts generated", alerts)
+        SEND_ALERTS(alerts)  // Could send emails, slack notifications, etc.
+    
+    RETURN alerts
